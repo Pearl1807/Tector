@@ -13,17 +13,16 @@ import sys
 import tempfile
 import time
 import winreg
+from xml.sax.saxutils import escape
 
 import cv2
 import mss
 import numpy as np
 from gradio_client import Client, handle_file
 from PIL import Image, ImageChops, ImageStat
-from winotify import Notification, audio
 
 APP_ID = "Tector"
 BANNER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "banner.py")
-QUNS_ACCEPTS_NOTIFICATIONS = 5  # SHQueryUserNotificationState: Windows will show toast banners
 MAX_SIDE = 512  # crops are downscaled before upload; the model only looks at 224px, and big uploads lag (4-11s vs 3.5s)
 CHANGE_THRESHOLD = 4.0  # mean pixel difference (0-255) that counts as "screen changed"
 WINDOW_COOLDOWN = 15  # min seconds between alerts for the same app (stops a playing AI video from spamming)
@@ -150,27 +149,44 @@ def changed(prev, img):
     return ImageStat.Stat(ImageChops.difference(a, b)).mean[0] > CHANGE_THRESHOLD
 
 
-def windows_shows_banners():
-    """False while Windows is suppressing toast banners (full-screen app, game, presentation, Do Not Disturb)."""
-    state = ctypes.c_int()
-    if ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state)) != 0:
-        return False  # unknown: better to show our banner too than risk showing nothing
-    return state.value == QUNS_ACCEPTS_NOTIFICATIONS
+def show_card(kind, title, message, image_path=None):
+    """Tector's own alert card (agent/banner.py): branded, and visible over full-screen apps."""
+    cmd = [sys.executable, BANNER_SCRIPT, "--kind", kind, "--title", title, "--message", message]
+    if image_path:
+        cmd += ["--image", image_path]
+    subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
 
 
-def notify(title, prob):
+def record_in_notification_center(title, message):
+    """Adds a silent entry to the Windows notification centre (no pop-up) so alerts keep a history."""
+    xml = (f'<toast><visual><binding template="ToastGeneric"><text>{escape(title)}</text>'
+           f'<text>{escape(message)}</text></binding></visual><audio silent="true"/></toast>')
+    script = f"""
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] > $null
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml(@'
+{xml}
+'@)
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+$toast.SuppressPopup = $true
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{APP_ID}').Show($toast)
+"""
+    subprocess.Popen(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                     creationflags=subprocess.CREATE_NO_WINDOW)
+
+
+def notify(title, prob, crop, tmp_dir):
     # Plain words instead of a percentage: the score isn't a calibrated probability, and "93%" suggests
     # more precision than the model has.
-    headline = "Very likely AI-generated" if prob >= SURE_THRESHOLD else "Possibly AI-generated"
-    message = f"Something on screen in \"{title[:60]}\" looks AI-made. Think twice before trusting or sharing it."
-    if not windows_shows_banners():
-        # Full-screen app / Do Not Disturb: Windows would only drop the toast into the notification
-        # centre, so show our own always-on-top banner instead
-        subprocess.Popen([sys.executable, BANNER_SCRIPT, headline, message], creationflags=subprocess.CREATE_NO_WINDOW)
-    # The Windows toast adds sound and keeps a record in the notification centre
-    toast = Notification(app_id=APP_ID, title=f"⚠️ {headline}", msg=message, duration="long")
-    toast.set_audio(audio.Default, loop=False)
-    toast.show()
+    sure = prob >= SURE_THRESHOLD
+    headline = "Very likely AI-generated" if sure else "Possibly AI-generated"
+    app = title if len(title) <= 40 else title[:39] + "…"
+    message = f"Seen in \"{app}\". Think twice before trusting or sharing it."
+    image_path = os.path.join(tmp_dir, f"tector_flagged_{int(time.time())}.jpg")
+    crop.save(image_path, quality=90)
+    show_card("alert" if sure else "possible", headline, message, image_path)
+    record_in_notification_center(f"⚠️ {headline}", message)
 
 
 def main():
@@ -185,8 +201,7 @@ def main():
     print(f"Connecting to {args.space} ...")
     client = Client(args.space, verbose=False)
     print(f"Watching your screen every {args.interval:g}s (alert at {args.threshold:.0%}). Ctrl+C to stop.")
-    Notification(app_id=APP_ID, title="Tector is watching",
-                 msg="You'll get an alert if AI-generated media shows up on screen.").show()
+    show_card("info", "Tector is watching", "You'll get an alert if AI-generated media shows up on screen.")
 
     tmp_dir = tempfile.gettempdir()
     prev, last_alert, suspicious = None, {}, {}  # suspicious: window title -> previous check was over threshold
@@ -221,7 +236,7 @@ def main():
                             else:
                                 last_alert[title] = now
                                 alerted.append((fp, now))
-                                notify(title, prob)
+                                notify(title, prob, crop, tmp_dir)
                                 print("           >>> notification sent")
                     else:
                         suspicious[title] = False
