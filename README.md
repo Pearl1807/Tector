@@ -76,6 +76,7 @@ level. Results are probabilities, not proof.
 | `app.py` | Web app + API (Gradio), deployed on Hugging Face Spaces |
 | `tector_head.npz` | Our trained classifier weights |
 | `agent/watcher.py` | Windows desktop watcher with notifications |
+| `agent/banner.py` | Tector's own alert banner, shown over full-screen apps where Windows hides notifications |
 | `Start Tector.bat` | Double-click launcher for the watcher |
 | `training/collect_data.py` | Builds the training/test sets from Hugging Face datasets |
 | `training/extract_features.py` | Computes CLIP ViT-L/14 features |

@@ -8,6 +8,8 @@ import argparse
 import ctypes
 import ctypes.wintypes
 import os
+import subprocess
+import sys
 import tempfile
 import time
 import winreg
@@ -20,6 +22,8 @@ from PIL import Image, ImageChops, ImageStat
 from winotify import Notification, audio
 
 APP_ID = "Tector"
+BANNER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "banner.py")
+QUNS_ACCEPTS_NOTIFICATIONS = 5  # SHQueryUserNotificationState: Windows will show toast banners
 MAX_SIDE = 512  # crops are downscaled before upload; the model only looks at 224px, and big uploads lag (4-11s vs 3.5s)
 CHANGE_THRESHOLD = 4.0  # mean pixel difference (0-255) that counts as "screen changed"
 WINDOW_COOLDOWN = 15  # min seconds between alerts for the same app (stops a playing AI video from spamming)
@@ -146,16 +150,25 @@ def changed(prev, img):
     return ImageStat.Stat(ImageChops.difference(a, b)).mean[0] > CHANGE_THRESHOLD
 
 
+def windows_shows_banners():
+    """False while Windows is suppressing toast banners (full-screen app, game, presentation, Do Not Disturb)."""
+    state = ctypes.c_int()
+    if ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state)) != 0:
+        return False  # unknown: better to show our banner too than risk showing nothing
+    return state.value == QUNS_ACCEPTS_NOTIFICATIONS
+
+
 def notify(title, prob):
     # Plain words instead of a percentage: the score isn't a calibrated probability, and "93%" suggests
     # more precision than the model has.
     headline = "Very likely AI-generated" if prob >= SURE_THRESHOLD else "Possibly AI-generated"
-    toast = Notification(
-        app_id=APP_ID,
-        title=f"⚠️ {headline}",
-        msg=f"Something on screen in \"{title[:60]}\" looks AI-made. Think twice before trusting or sharing it.",
-        duration="long",
-    )
+    message = f"Something on screen in \"{title[:60]}\" looks AI-made. Think twice before trusting or sharing it."
+    if not windows_shows_banners():
+        # Full-screen app / Do Not Disturb: Windows would only drop the toast into the notification
+        # centre, so show our own always-on-top banner instead
+        subprocess.Popen([sys.executable, BANNER_SCRIPT, headline, message], creationflags=subprocess.CREATE_NO_WINDOW)
+    # The Windows toast adds sound and keeps a record in the notification centre
+    toast = Notification(app_id=APP_ID, title=f"⚠️ {headline}", msg=message, duration="long")
     toast.set_audio(audio.Default, loop=False)
     toast.show()
 
