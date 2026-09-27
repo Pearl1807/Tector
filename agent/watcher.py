@@ -23,6 +23,7 @@ from PIL import Image, ImageChops, ImageStat
 
 APP_ID = "Tector"
 BANNER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "banner.py")
+LOG_PATH = os.path.join(tempfile.gettempdir(), "tector.log")
 MAX_SIDE = 512  # crops are downscaled before upload; the model only looks at 224px, and big uploads lag (4-11s vs 3.5s)
 CHANGE_THRESHOLD = 4.0  # mean pixel difference (0-255) that counts as "screen changed"
 WINDOW_COOLDOWN = 15  # min seconds between alerts for the same app (stops a playing AI video from spamming)
@@ -131,6 +132,16 @@ def check_regions(client, img, boxes, tmp_dir):
     return probs[best], crops[best]
 
 
+def say(msg):
+    """Prints to the console and appends to %TEMP%\\tector.log, so a session can be reviewed afterwards."""
+    print(msg, flush=True)
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except OSError:
+        pass
+
+
 def fingerprint(img):
     """Tiny perceptual hash: the same picture gives (nearly) the same bits even after scrolling/rescaling."""
     small = np.asarray(img.convert("L").resize((8, 8), Image.BILINEAR), dtype=np.float32)
@@ -198,9 +209,9 @@ def main():
     args = parser.parse_args()
 
     register_app_id()
-    print(f"Connecting to {args.space} ...")
+    say(f"Connecting to {args.space} ...")
     client = Client(args.space, verbose=False)
-    print(f"Watching your screen every {args.interval:g}s (alert at {args.threshold:.0%}). Ctrl+C to stop.")
+    say(f"Watching your screen every {args.interval:g}s (alert at {args.threshold:.0%}). Ctrl+C to stop.")
     show_card("info", "Tector is watching", "You'll get an alert if AI-generated media shows up on screen.")
 
     tmp_dir = tempfile.gettempdir()
@@ -223,28 +234,28 @@ def main():
                         # (the next video frame, or a re-check of a still image) so one odd frame can't alert.
                         confirmed = over and (prob >= SURE_THRESHOLD or suspicious.get(title, False))
                         note = "  (checking again to confirm)" if over and not confirmed else ""
-                        print(f"[{stamp}] {prob:.0%} AI ({len(boxes)} media area(s))  |  {title[:60]}{note}")
+                        say(f"[{stamp}] {prob:.0%} AI ({len(boxes)} media area(s))  |  {title[:60]}{note}")
                         suspicious[title] = over and not confirmed
                         if suspicious[title]:
                             prev = None  # force a re-check even if the screen doesn't change
                         if confirmed:
                             now, fp = time.time(), fingerprint(crop)
                             if already_alerted(fp, alerted, now):
-                                print("           (already alerted for this picture)")
+                                say("           (already alerted for this picture)")
                             elif now - last_alert.get(title, 0) < WINDOW_COOLDOWN:
-                                print(f"           (alerted for this app {now - last_alert[title]:.0f}s ago, staying quiet)")
+                                say(f"           (alerted for this app {now - last_alert[title]:.0f}s ago, staying quiet)")
                             else:
                                 last_alert[title] = now
                                 alerted.append((fp, now))
                                 notify(title, prob, crop, tmp_dir)
-                                print("           >>> notification sent")
+                                say("           >>> notification sent")
                     else:
                         suspicious[title] = False
-                        print(f"[{stamp}] no pictures/video on screen  |  {title[:70]}")
+                        say(f"[{stamp}] no pictures/video on screen  |  {title[:70]}")
             except KeyboardInterrupt:
                 raise
             except Exception as e:  # keep running through network hiccups / Space restarts
-                print(f"[{time.strftime('%H:%M:%S')}] check failed: {e}")
+                say(f"[{time.strftime('%H:%M:%S')}] check failed: {e}")
             if args.once:
                 break
             time.sleep(args.interval)

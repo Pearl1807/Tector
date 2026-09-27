@@ -8,12 +8,17 @@ Usage:
 """
 import argparse
 import ctypes
+import os
+import tempfile
+import time
 import tkinter as tk
+import traceback
 import winsound
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageTk
 
 SHOW_MS = 8000
+MAX_HOVER_MS = 12000
 W, H = 460, 148  # logical size; scaled for the screen's DPI
 PAD, THUMB = 16, 116
 SS = 2  # supersampling factor for smooth shapes
@@ -29,6 +34,16 @@ KINDS = {
     "info": {"accent": (45, 212, 191), "level": 0, "label": ""},
 }
 FONTS = r"C:\Windows\Fonts"
+LOG_PATH = os.path.join(tempfile.gettempdir(), "tector_banner.log")
+
+
+def log(msg):
+    """The card runs without a console, so problems are written here instead."""
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} [{os.getpid()}] {msg}\n")
+    except OSError:
+        pass
 
 
 def font(name, size):
@@ -178,7 +193,10 @@ def main():
     root.update_idletasks()
     round_window_corners(root)
 
-    state = {"left": SHOW_MS, "hover": False, "closing": False}
+    log(f"show kind={args.kind} at {end_x},{y} size {w}x{h} screen {root.winfo_screenwidth()}x"
+        f"{root.winfo_screenheight()} scale {scale:.2f}")
+    root.report_callback_exception = lambda *exc: log("error: " + "".join(traceback.format_exception(*exc)))
+    state = {"left": SHOW_MS, "hover": False, "closing": False, "ticks": 0}
 
     def slide_in(step=0, steps=14):
         t = step / steps
@@ -194,12 +212,15 @@ def main():
         if step < steps:
             root.after(16, close, step + 1)
         else:
+            log("closed")
             root.destroy()
 
     def tick():
         if state["closing"]:
             return
-        if not state["hover"]:
+        state["ticks"] += 1
+        # Hovering pauses the countdown, but never for more than MAX_HOVER_MS (a mouse resting in the corner)
+        if not state["hover"] or state["ticks"] * 50 > SHOW_MS + MAX_HOVER_MS:
             state["left"] -= 50
         canvas.coords(bar, 0, h - px(3), w * max(0, state["left"]) / SHOW_MS, h)
         if state["left"] <= 0:
