@@ -52,6 +52,12 @@ Upload `real_face_woman.jpg` → green **Likely real**. Upload `ai_face_woman.jp
 "It gives a probability, not proof. Midjourney is its weakest generator, and about 1 in 20 real
 photos can score high. That's why the alert says 'Very likely' or 'Possibly' instead of a number."
 
+## If a judge asks about video
+
+"Tector checks video frame by frame, on the website and on screen. We tested it on videos from Google Veo 3, the newest
+generator, and it caught only 1 of 8, because our model was trained on still images. Our next step is training on AI
+video frames. We've already written the data pipeline for it." Don't demo video live.
+
 ## If a judge wants to try their own picture
 
 Say yes, and set expectations first: "It's strongest on AI faces and Stable Diffusion, weaker on

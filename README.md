@@ -70,7 +70,7 @@ ADM, GLIDE, VQDM, Wukong, BigGAN, StyleGAN faces) from
 | BigGAN / VQDM / GLIDE caught | 0/20, 0/20, 5/20 | **20/20, 19/20, 19/20** |
 | Midjourney caught | 16/20 | 12/20 |
 
-**Known limitations:** Midjourney is the weakest generator. About 5% of real photos score above the 70% alert
+**Known limitations:** Video is checked frame by frame with the image model, and it has not been trained on AI video yet: on 8 Google Veo 3 clips it flagged only 1. `training/collect_video_frames.py` gathers Veo 3, Kling and real stock-footage frames for that next training round. Midjourney is the weakest image generator. About 5% of real photos score above the 70% alert
 level. Results are probabilities, not proof.
 
 ## Project structure
