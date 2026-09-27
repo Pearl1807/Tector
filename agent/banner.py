@@ -21,20 +21,20 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 SHOW_MS = 8000
 MAX_HOVER_MS = 12000
-W, H = 420, 128  # logical size; scaled for the screen's DPI
-PAD, THUMB = 16, 96
+W, H = 440, 132  # logical size; scaled for the screen's DPI
+PAD, THUMB = 16, 100
+PANEL = PAD * 2 + THUMB  # solid colour panel on the left that holds the thumbnail
 SS = 2  # supersampling factor for smooth shapes
 
-# Flat, neutral palette: one background colour, colour only where it carries meaning
-BG = (31, 31, 33)
-BORDER = (58, 58, 62)
-TEXT = (240, 240, 240)
-SUBTEXT = (160, 160, 165)
-TILE = (44, 44, 48)
+# Solid colours only (no gradients): a dark body, and one strong colour per alert level
+BG = (28, 28, 31)
+BORDER = (46, 46, 51)
+TEXT = (246, 246, 247)
+SUBTEXT = (165, 165, 172)
 KINDS = {
-    "alert": {"accent": (229, 72, 77), "label": "High confidence"},
-    "possible": {"accent": (245, 165, 36), "label": "Medium confidence"},
-    "info": {"accent": (120, 160, 230), "label": ""},
+    "alert": {"accent": (229, 72, 77), "on_accent": (255, 255, 255), "label": "High confidence"},
+    "possible": {"accent": (247, 170, 40), "on_accent": (40, 24, 0), "label": "Medium confidence"},
+    "info": {"accent": (79, 124, 255), "on_accent": (255, 255, 255), "label": ""},
 }
 FONTS = r"C:\Windows\Fonts"
 LOG_PATH = os.path.join(tempfile.gettempdir(), "tector_banner.log")
@@ -93,42 +93,50 @@ def wrap(draw, text, fnt, width):
 def render_card(kind, title, message, image, scale):
     """Draws the static card with Pillow (anti-aliased text and shapes)."""
     k = KINDS[kind]
+    accent, on_accent = k["accent"], k["on_accent"]
     px = lambda v: int(round(v * scale))  # noqa: E731
     w, h = px(W), px(H)
     card = Image.new("RGB", (w, h), BG)
     d = ImageDraw.Draw(card)
 
-    # thumbnail of the flagged picture (or the Tector mark for info cards)
-    tx, ty, ts = px(PAD), px(PAD), px(THUMB)
+    # solid colour panel with the flagged picture (or the Tector mark for info cards)
+    d.rectangle([0, 0, px(PANEL), h], fill=accent)
+    tx, ts = px(PAD), px(THUMB)
+    ty = (h - ts) // 2
     if image is not None:
         thumb = (image if isinstance(image, Image.Image) else Image.open(image)).convert("RGB")
         side = min(thumb.size)
         thumb = thumb.crop(((thumb.width - side) // 2, (thumb.height - side) // 2,
                             (thumb.width + side) // 2, (thumb.height + side) // 2)).resize((ts, ts), Image.LANCZOS)
+        card.paste(thumb, (tx, ty), rounded_mask((ts, ts), px(8)))
     else:
-        thumb = Image.new("RGB", (ts, ts), TILE)
-        mark = logo_mark(px(40), SUBTEXT + (255,))
-        thumb.paste(mark, ((ts - mark.width) // 2, (ts - mark.height) // 2), mark)
-    card.paste(thumb, (tx, ty), rounded_mask((ts, ts), px(6)))
+        mark = logo_mark(px(48), on_accent + (255,))
+        card.paste(mark, (tx + (ts - mark.width) // 2, ty + (ts - mark.height) // 2), mark)
 
-    x0 = tx + ts + px(16)
-    d.text((x0, px(14)), "Tector", font=font("seguisb.ttf", px(11)), fill=SUBTEXT)
-    d.text((x0, px(31)), title, font=font("seguisb.ttf", px(16)), fill=TEXT)
+    # brand row: Tector mark in the accent colour + name
+    x0 = px(PANEL + 16)
+    mark = logo_mark(px(13), accent + (255,))
+    card.paste(mark, (x0, px(16)), mark)
+    d.text((x0 + px(18), px(13)), "Tector", font=font("seguisb.ttf", px(11.5)), fill=TEXT)
+
+    d.text((x0, px(33)), title, font=font("seguisb.ttf", px(16)), fill=TEXT)
     msg_font = font("segoeui.ttf", px(12))
     for i, line in enumerate(wrap(d, message, msg_font, w - x0 - px(PAD))[:2]):
-        d.text((x0, px(56) + i * px(17)), line, font=msg_font, fill=SUBTEXT)
+        d.text((x0, px(57) + i * px(17)), line, font=msg_font, fill=SUBTEXT)
 
-    if k["label"]:  # confidence: a small solid square in the alert colour + plain text
-        sy = px(97)
-        d.rectangle([x0, sy + px(4), x0 + px(8), sy + px(12)], fill=k["accent"])
-        d.text((x0 + px(14), sy), k["label"], font=font("segoeui.ttf", px(11.5)), fill=TEXT)
+    if k["label"]:  # confidence badge: solid pill in the alert colour
+        chip_font = font("seguisb.ttf", px(10.5))
+        cw = int(d.textlength(k["label"], font=chip_font)) + px(18)
+        cy = px(100)
+        d.rounded_rectangle([x0, cy, x0 + cw, cy + px(20)], px(10), fill=accent)
+        d.text((x0 + px(9), cy + px(3)), k["label"], font=chip_font, fill=on_accent)
 
     # close button
     cx, cy, cr = w - px(20), px(20), px(4.5)
     d.line([cx - cr, cy - cr, cx + cr, cy + cr], fill=SUBTEXT, width=max(1, px(1.4)))
     d.line([cx - cr, cy + cr, cx + cr, cy - cr], fill=SUBTEXT, width=max(1, px(1.4)))
 
-    d.rectangle([0, 0, w - 1, h - 1], outline=BORDER)
+    d.rectangle([px(PANEL), 0, w - 1, h - 1], outline=BORDER)  # border around the dark body only
     return card
 
 
