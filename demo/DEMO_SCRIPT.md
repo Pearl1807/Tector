@@ -17,7 +17,7 @@ full screen. Use only these for the live demo.
 3. Double-click `Start Tector.bat` and wait for the blue "Watching your screen" card.
 4. Close other windows. Open this `demo` folder in File Explorer.
 5. Do one full run-through of steps 2 and 3 below.
-6. Record a screen video of a successful run (Win + Alt + R) as a backup in case the Wi-Fi fails.
+6. Record a screen video of a successful run as a backup in case the Wi-Fi fails. Use the Snipping Tool (Win + Shift + R), not Win + Alt + R: Game Bar records a single window and would miss the Tector card.
 
 ## 1. The problem (20 s)
 

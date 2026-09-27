@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 demo/*.jpg
 Tector_slides.pdf
+demo/video/
