@@ -3,3 +3,6 @@ mss>=10.2
 numpy
 opencv-python-headless<5
 pillow
+# for running the detector on this computer (the default); not needed with --space
+torch
+transformers

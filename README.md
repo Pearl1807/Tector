@@ -111,8 +111,9 @@ Chrome, and page layouts built to mimic TikTok, Pinterest and the Photos app.
 pictures on a page, trimming captions, ignoring icons, telling the main picture from a filmstrip or
 grid, recognising a picture already alerted on, and detecting screen changes.
 
-**Speed.** A check takes 4-7 s (down from 17-23 s, by sending only the main picture, downscaled to
-512 px). The alert card appears 0.07 s after a detection.
+**Speed.** By default the detector runs on the user's computer: about 2 s per check on a laptop CPU
+(6 s via the Space, 17-23 s before we sent only the main picture). The alert card appears 0.07 s after a
+detection.
 
 **Cost.** The Space runs on Hugging Face's free CPU Basic hardware (Gradio Spaces need a Hugging Face
 PRO account, $9/month), so there is no cost per check. Upgrading to 8 CPUs ($0.03/hour) would roughly
@@ -132,11 +133,11 @@ halve the delay. Training ran on a laptop CPU, with no GPU.
 ## Responsible AI & data
 
 **Privacy.** The watcher only runs after the user starts it, and says so with a "Watching your screen"
-card; closing the window stops it. It sends only the cropped picture (at most 512 px), and only when the
-screen changes, never the whole screen. The Space deletes uploaded images within about two minutes
+card; closing the window stops it. By default the detector runs on the user's own computer, so pictures
+never leave the device. In the optional online mode (`--space`) it sends only the cropped picture (at
+most 512 px), never the whole screen. The Space deletes uploaded images within about two minutes
 (`delete_cache`), never stores them and never uses them for training. The local log records scores
-only, not window titles. The crops do leave the device, which is why an on-device version is our next
-step.
+only, not window titles.
 
 **Consent.** The web app's example real photos contain no identifiable people. The demo faces are
 either generated (StyleGAN, so no real person) or from the FFHQ research dataset.
@@ -177,8 +178,10 @@ our code is Apache 2.0. The example images in `examples/` come from these datase
 ```
 python -m venv .venv
 .venv\Scripts\pip install -r agent\requirements.txt
-.venv\Scripts\python agent\watcher.py --space Miration/Tector
+.venv\Scripts\python agent\watcher.py
 ```
+The detector runs on this computer (first start downloads CLIP, about 1.7 GB). Add
+`--space Miration/Tector` to use the online Space instead.
 Or double-click `Start Tector.bat` after the install. Options: `--interval 1` (seconds between checks),
 `--threshold 0.8` (alert level).
 

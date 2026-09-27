@@ -2,7 +2,10 @@
 user when the active window appears to be showing an AI-generated picture.
 
 Usage:
-    python watcher.py --space <username>/<space-name> [--interval 1] [--threshold 0.7]
+    python watcher.py [--space <username>/<space-name>] [--interval 1] [--threshold 0.7]
+
+By default the detector runs on this computer (fast, offline, private). With --space it uses the
+Hugging Face Space instead.
 """
 import argparse
 import ctypes
@@ -17,10 +20,11 @@ from xml.sax.saxutils import escape
 import cv2
 import mss
 import numpy as np
-from gradio_client import Client, handle_file
+from gradio_client import Client
 from PIL import Image, ImageChops, ImageStat
 
 from banner import CARD_TITLE, Notifier
+from detectors import LocalDetector, SpaceDetector
 
 APP_ID = "Tector"
 LOG_PATH = os.path.join(tempfile.gettempdir(), "tector.log")
@@ -123,18 +127,14 @@ def media_regions(img):
     return boxes[:MAX_REGIONS]
 
 
-def check_regions(client, img, boxes, tmp_dir):
-    """Sends all media areas to the Space in one request; returns [(AI probability, crop, box), ...]."""
-    crops, paths = [], []
-    for i, box in enumerate(boxes):
+def check_regions(detector, img, boxes, tmp_dir):
+    """Scores all media areas in one batch; returns [(AI probability, crop, box), ...]."""
+    crops = []
+    for box in boxes:
         crop = img.crop(box)
         crop.thumbnail((MAX_SIDE, MAX_SIDE))
-        path = os.path.join(tmp_dir, f"tector_region_{i}.jpg")
-        crop.save(path, quality=90)
         crops.append(crop)
-        paths.append(handle_file(path))
-    probs = client.predict(paths, api_name="/detect_batch")["probs"]
-    return list(zip(probs, crops, boxes))
+    return list(zip(detector.probs(crops, tmp_dir), crops, boxes))
 
 
 def box_area(box):
@@ -230,17 +230,10 @@ def connect(space, notifier):
             time.sleep(RECONNECT_WAIT)
 
 
-def reconnect(space, client):
-    """A restarted Space can invalidate the old session, so try a fresh connection."""
-    try:
-        return Client(space, verbose=False)
-    except Exception:
-        return client
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--space", required=True, help="Hugging Face Space id (user/name) or URL")
+    parser.add_argument("--space", help="use this Hugging Face Space (user/name) instead of running the "
+                                        "detector on this computer")
     parser.add_argument("--interval", type=float, default=1, help="seconds to wait between screen checks")
     parser.add_argument("--threshold", type=float, default=0.7, help="alert when AI probability >= this")
     parser.add_argument("--once", action="store_true", help="check the screen once and exit")
@@ -248,7 +241,13 @@ def main():
 
     register_app_id()
     notifier = Notifier()
-    client = connect(args.space, notifier)
+    if args.space:
+        detector = SpaceDetector(args.space, connect(args.space, notifier))
+    else:
+        say("Loading the detector on this computer (about 30 s) ...")
+        notifier.show("info", "Starting Tector", "Loading the detector on this computer. This takes about 30 seconds.")
+        detector = LocalDetector()
+    say(f"Detector: {detector.name}")
     say(f"Watching your screen (alert at {args.threshold:.0%}). Ctrl+C to stop.")
     notifier.show("info", "Watching your screen", "You'll get an alert if AI-generated media shows up.")
 
@@ -273,7 +272,7 @@ def main():
                         to_check = main_boxes[:1] or boxes[:MAX_GRID_CHECK]
                         bar = args.threshold if main_boxes else max(args.threshold, GRID_THRESHOLD)
                         try:
-                            results = check_regions(client, img, to_check, tmp_dir)
+                            results = check_regions(detector, img, to_check, tmp_dir)
                         except Exception as e:  # Space asleep/restarting, or no internet
                             failures += 1
                             prev = None  # retry this screen on the next check
@@ -283,7 +282,7 @@ def main():
                                 notifier.show("offline", "Tector can't reach the detector",
                                               "You're not protected right now. Tector keeps retrying.")
                             if failures % OFFLINE_AFTER == 0:
-                                client = reconnect(args.space, client)
+                                detector.reconnect()
                             results = None
                         if results is not None:
                             if failures >= OFFLINE_AFTER:
