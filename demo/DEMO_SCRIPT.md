@@ -30,7 +30,8 @@ Upload `real_face_woman.jpg` → green **Likely real**. Upload `ai_face_woman.jp
 
 ## 3. The desktop app: the main feature (60 s)
 
-"Nobody uploads every picture they see to a website, so Tector watches the screen for you, in any app."
+"Nobody uploads every picture they see to a website, so Tector checks the screen for you. Because it reads the
+screen, it works the same in a browser, the Photos app or any desktop app."
 
 1. Open `ai_face_boy.jpg` in the Photos app, full screen. The Tector alert appears after about 5 seconds,
    with a thumbnail of the picture it flagged.

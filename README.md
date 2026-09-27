@@ -8,16 +8,22 @@ sdk_version: 6.28.0
 app_file: app.py
 pinned: false
 license: apache-2.0
-short_description: Detect AI-generated images, videos and deepfakes
+short_description: Detect AI-generated images on your screen
 ---
 
 # 🔍 Tector
 
-**Tector warns you when you're looking at AI-generated media, in any app.**
+**Tector warns you when a picture on your screen is likely AI-generated.**
 
-A small Windows program watches your screen. When a picture or video that is likely AI-generated appears
-(on TikTok, Pinterest, Instagram, YouTube, WhatsApp Desktop or any other app), you get a Windows notification.
-A web app lets anyone upload an image or video to check it.
+A small Windows program checks the window you're looking at. Because it reads the screen rather than
+connecting to a particular website, it isn't tied to one platform: it works the same in a browser, the
+Photos app or a desktop app. When a picture is likely AI-generated, an alert card appears.
+A web app lets anyone upload an image to check it.
+
+**What we've tested:** still images, with 91% accuracy on 340 held-out images (see below). We tested the
+screen watcher on photos opened in the Photos app, pictures in Chrome, and page layouts we built to mimic
+TikTok and Pinterest, but not systematically on the live platforms. **Video is experimental:** it's checked
+frame by frame, and on modern AI video (Google Veo 3) it caught only 1 of 8 clips.
 
 - **Live web app:** https://huggingface.co/spaces/Miration/Tector
 - **Detector:** our own classifier, trained during the hackathon (91% accuracy on held-out images)
@@ -37,7 +43,7 @@ A web app lets anyone upload an image or video to check it.
 **Why crop to the media?** Sending the whole window confused the detector: a real photo inside a web page
 scored 92% AI, and a small AI image scored only 30%. Cropping to just the picture fixed both.
 
-**Fast, focused checks.** When there is a main picture or video on screen (a photo you opened, a TikTok
+**Fast, focused checks.** When there is a main picture or video on screen (a photo you opened, a playing
 video), only that is checked, so an alert appears about 4-6 seconds after it shows up. Otherwise up to 4
 thumbnails are checked, and each must reach 90% (instead of 70%) to keep false alarms low in grids.
 

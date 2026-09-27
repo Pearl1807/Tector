@@ -1,5 +1,5 @@
 """Tector desktop watcher: runs in the background, checks what's on screen, and notifies the
-user when the active window appears to be showing AI-generated or deepfaked media.
+user when the active window appears to be showing an AI-generated picture.
 
 Usage:
     python watcher.py --space <username>/<space-name> [--interval 1] [--threshold 0.7]
