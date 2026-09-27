@@ -26,7 +26,7 @@ A web app lets anyone upload an image or video to check it.
 
 ```
  Your screen ──► Desktop watcher (agent/watcher.py)
-                   1. screenshots the active window every 5 s
+                   1. screenshots the active window every few seconds
                    2. finds the picture/video areas (skips toolbars, text, icons)
                    3. sends only those crops ──────────────► Tector detector on Hugging Face (app.py)
                                                                CLIP ViT-L/14 features
@@ -89,7 +89,7 @@ python -m venv .venv
 .venv\Scripts\pip install -r agent\requirements.txt
 .venv\Scripts\python agent\watcher.py --space Miration/Tector
 ```
-Or double-click `Start Tector.bat` after the install. Options: `--interval 3` (seconds between checks),
+Or double-click `Start Tector.bat` after the install. Options: `--interval 1` (seconds between checks),
 `--threshold 0.8` (alert level).
 
 **Web app locally:**

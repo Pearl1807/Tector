@@ -20,9 +20,10 @@ from PIL import Image, ImageChops, ImageStat
 from winotify import Notification, audio
 
 APP_ID = "Tector"
-MAX_SIDE = 1280  # downscale screenshots before upload to keep requests fast
+MAX_SIDE = 512  # crops are downscaled before upload; the model only looks at 224px, and big uploads lag (4-11s vs 3.5s)
 CHANGE_THRESHOLD = 4.0  # mean pixel difference (0-255) that counts as "screen changed"
-NOTIFY_COOLDOWN = 60  # seconds between alerts for the same app
+WINDOW_COOLDOWN = 15  # min seconds between alerts for the same app (stops a playing AI video from spamming)
+IMAGE_MEMORY = 600  # seconds we remember an image we already alerted on, so scrolling back doesn't re-alert
 MAX_REGIONS = 6  # media areas checked per screen (e.g. pins in a Pinterest grid), sent as one batch
 SURE_THRESHOLD = 0.85  # alert on a single check at or above this; below it needs two checks in a row
 GRID_THRESHOLD = 0.9  # alert bar when several pictures are on screen (1.4% false alarms per picture vs 5% at 0.7)
@@ -113,15 +114,28 @@ def media_regions(img):
 
 
 def check_regions(client, img, boxes, tmp_dir):
-    """Sends all media areas to the Space in one request; returns the highest AI probability."""
-    paths = []
+    """Sends all media areas to the Space in one request; returns (highest AI probability, that crop)."""
+    crops, paths = [], []
     for i, box in enumerate(boxes):
         crop = img.crop(box)
         crop.thumbnail((MAX_SIDE, MAX_SIDE))
         path = os.path.join(tmp_dir, f"tector_region_{i}.jpg")
-        crop.save(path, quality=95)
+        crop.save(path, quality=90)
+        crops.append(crop)
         paths.append(handle_file(path))
-    return max(client.predict(paths, api_name="/detect_batch")["probs"])
+    probs = client.predict(paths, api_name="/detect_batch")["probs"]
+    best = int(np.argmax(probs))
+    return probs[best], crops[best]
+
+
+def fingerprint(img):
+    """Tiny perceptual hash: the same picture gives (nearly) the same bits even after scrolling/rescaling."""
+    small = np.asarray(img.convert("L").resize((8, 8), Image.BILINEAR), dtype=np.float32)
+    return small > small.mean()
+
+
+def already_alerted(fp, alerted, now):
+    return any(now - t < IMAGE_MEMORY and np.count_nonzero(fp != old) <= 6 for old, t in alerted)
 
 
 def changed(prev, img):
@@ -133,10 +147,13 @@ def changed(prev, img):
 
 
 def notify(title, prob):
+    # Plain words instead of a percentage: the score isn't a calibrated probability, and "93%" suggests
+    # more precision than the model has.
+    headline = "Very likely AI-generated" if prob >= SURE_THRESHOLD else "Possibly AI-generated"
     toast = Notification(
         app_id=APP_ID,
-        title="⚠️ AI-generated media detected",
-        msg=f"{prob:.0%} likely AI in \"{title[:60]}\". Be careful what you trust or share.",
+        title=f"⚠️ {headline}",
+        msg=f"Something on screen in \"{title[:60]}\" looks AI-made. Think twice before trusting or sharing it.",
         duration="long",
     )
     toast.set_audio(audio.Default, loop=False)
@@ -146,7 +163,7 @@ def notify(title, prob):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--space", required=True, help="Hugging Face Space id (user/name) or URL")
-    parser.add_argument("--interval", type=float, default=5, help="seconds between screen checks")
+    parser.add_argument("--interval", type=float, default=2, help="seconds to wait between screen checks")
     parser.add_argument("--threshold", type=float, default=0.7, help="alert when AI probability >= this")
     parser.add_argument("--once", action="store_true", help="check the screen once and exit")
     args = parser.parse_args()
@@ -160,6 +177,7 @@ def main():
 
     tmp_dir = tempfile.gettempdir()
     prev, last_alert, suspicious = None, {}, {}  # suspicious: window title -> previous check was over threshold
+    alerted = []  # (fingerprint, time) of pictures we already alerted on
     with mss.MSS() as sct:
         while True:
             try:
@@ -169,7 +187,7 @@ def main():
                     stamp = time.strftime("%H:%M:%S")
                     boxes = media_regions(img)
                     if boxes:
-                        prob = check_regions(client, img, boxes, tmp_dir)
+                        prob, crop = check_regions(client, img, boxes, tmp_dir)
                         # Each picture has a small false-alarm chance, so a grid of many needs a stricter bar
                         bar = args.threshold if len(boxes) == 1 else max(args.threshold, GRID_THRESHOLD)
                         over = prob >= bar
@@ -181,9 +199,17 @@ def main():
                         suspicious[title] = over and not confirmed
                         if suspicious[title]:
                             prev = None  # force a re-check even if the screen doesn't change
-                        if confirmed and time.time() - last_alert.get(title, 0) > NOTIFY_COOLDOWN:
-                            last_alert[title] = time.time()
-                            notify(title, prob)
+                        if confirmed:
+                            now, fp = time.time(), fingerprint(crop)
+                            if already_alerted(fp, alerted, now):
+                                print("           (already alerted for this picture)")
+                            elif now - last_alert.get(title, 0) < WINDOW_COOLDOWN:
+                                print(f"           (alerted for this app {now - last_alert[title]:.0f}s ago, staying quiet)")
+                            else:
+                                last_alert[title] = now
+                                alerted.append((fp, now))
+                                notify(title, prob)
+                                print("           >>> notification sent")
                     else:
                         suspicious[title] = False
                         print(f"[{stamp}] no pictures/video on screen  |  {title[:70]}")
