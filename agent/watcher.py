@@ -27,6 +27,8 @@ LOG_PATH = os.path.join(tempfile.gettempdir(), "tector.log")
 OWN_WINDOWS = {CARD_TITLE, "tk"}  # our alert card: never scan it
 MAX_SIDE = 512  # crops are downscaled before upload; the model only looks at 224px, and big uploads lag (4-11s vs 3.5s)
 CHANGE_THRESHOLD = 4.0  # mean pixel difference (0-255) that counts as "screen changed"
+OFFLINE_AFTER = 2  # failed checks in a row before warning the user they're not protected
+RECONNECT_WAIT = 10  # seconds between connection attempts at start-up
 SOURCE_QUIET = 30  # an AI video still playing in the same spot re-alerts quietly (no sound) for this long
 IMAGE_MEMORY = 600  # seconds we remember an image we already alerted on, so scrolling back doesn't re-alert
 MAX_REGIONS = 6  # media areas found per screen
@@ -148,9 +150,10 @@ def is_main_media(box, img, boxes):
     return box_area(box) == areas[0] and areas[0] >= MAIN_MEDIA_DOMINANCE * areas[1]
 
 
-def say(msg):
-    """Prints to the console and appends to %TEMP%\\tector.log, so a session can be reviewed afterwards."""
-    print(msg, flush=True)
+def say(msg, window=None):
+    """Prints to the console and appends to %TEMP%\\tector.log, so a session can be reviewed afterwards.
+    Privacy: the window title (which can reveal what the user is doing) is shown on screen only, never saved."""
+    print(msg + (f"  |  {window[:60]}" if window else ""), flush=True)
     try:
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
@@ -211,6 +214,30 @@ def source_key(title, box):
     return title, tuple(v // 50 for v in box)
 
 
+def connect(space, notifier):
+    """Connects to the detector Space, telling the user (instead of crashing) while it's unreachable."""
+    warned = False
+    while True:
+        say(f"Connecting to {space} ...")
+        try:
+            return Client(space, verbose=False)
+        except Exception as e:
+            say(f"couldn't connect ({type(e).__name__}), retrying in {RECONNECT_WAIT}s")
+            if not warned:
+                notifier.show("offline", "Tector can't reach the detector",
+                              "You're not protected yet. Check your internet; Tector keeps retrying.")
+                warned = True
+            time.sleep(RECONNECT_WAIT)
+
+
+def reconnect(space, client):
+    """A restarted Space can invalidate the old session, so try a fresh connection."""
+    try:
+        return Client(space, verbose=False)
+    except Exception:
+        return client
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--space", required=True, help="Hugging Face Space id (user/name) or URL")
@@ -221,13 +248,13 @@ def main():
 
     register_app_id()
     notifier = Notifier()
-    say(f"Connecting to {args.space} ...")
-    client = Client(args.space, verbose=False)
+    client = connect(args.space, notifier)
     say(f"Watching your screen (alert at {args.threshold:.0%}). Ctrl+C to stop.")
     notifier.show("info", "Watching your screen", "You'll get an alert if AI-generated media shows up.")
 
     tmp_dir = tempfile.gettempdir()
     prev = None
+    failures = 0  # checks in a row that couldn't reach the detector
     alerted = []  # (fingerprint, time) of pictures we already alerted on
     last_sound = {}  # source key -> time we last alerted with sound
     with mss.MSS() as sct:
@@ -245,23 +272,40 @@ def main():
                         # need a stricter bar.
                         to_check = main_boxes[:1] or boxes[:MAX_GRID_CHECK]
                         bar = args.threshold if main_boxes else max(args.threshold, GRID_THRESHOLD)
-                        prob, crop, box = max(check_regions(client, img, to_check, tmp_dir), key=lambda r: r[0])
-                        kind = "main picture" if main_boxes else f"best of {len(to_check)} thumbnails"
-                        say(f"[{stamp}] {prob:.0%} AI ({kind}, {time.time() - started:.1f}s)  |  {title[:60]}")
-                        if prob >= bar:
-                            now, fp, key = time.time(), fingerprint(crop), source_key(title, box)
-                            if already_alerted(fp, alerted, now):
-                                say("           (already alerted for this picture)")
-                            else:
-                                alerted.append((fp, now))
-                                # Same video/slot alerted recently -> update the card quietly; new source -> sound
-                                sound = now - last_sound.get(key, 0) > SOURCE_QUIET
-                                if sound:
-                                    last_sound[key] = now
-                                notify(notifier, title, prob, crop, key, sound)
-                                say(f"           >>> alert shown{'' if sound else ' (quietly, same source)'}")
+                        try:
+                            results = check_regions(client, img, to_check, tmp_dir)
+                        except Exception as e:  # Space asleep/restarting, or no internet
+                            failures += 1
+                            prev = None  # retry this screen on the next check
+                            say(f"[{stamp}] couldn't reach the detector ({type(e).__name__})")
+                            if failures == OFFLINE_AFTER:
+                                # Silence would make the user think they're protected, so say so clearly
+                                notifier.show("offline", "Tector can't reach the detector",
+                                              "You're not protected right now. Tector keeps retrying.")
+                            if failures % OFFLINE_AFTER == 0:
+                                client = reconnect(args.space, client)
+                            results = None
+                        if results is not None:
+                            if failures >= OFFLINE_AFTER:
+                                notifier.show("info", "Protection is back on", "Tector can reach the detector again.")
+                            failures = 0
+                            prob, crop, box = max(results, key=lambda r: r[0])
+                            kind = "main picture" if main_boxes else f"best of {len(to_check)} thumbnails"
+                            say(f"[{stamp}] {prob:.0%} AI ({kind}, {time.time() - started:.1f}s)", title)
+                            if prob >= bar:
+                                now, fp, key = time.time(), fingerprint(crop), source_key(title, box)
+                                if already_alerted(fp, alerted, now):
+                                    say("           (already alerted for this picture)")
+                                else:
+                                    alerted.append((fp, now))
+                                    # Same video/slot alerted recently -> update the card quietly; new source -> sound
+                                    sound = now - last_sound.get(key, 0) > SOURCE_QUIET
+                                    if sound:
+                                        last_sound[key] = now
+                                    notify(notifier, title, prob, crop, key, sound)
+                                    say(f"           >>> alert shown{'' if sound else ' (quietly, same source)'}")
                     else:
-                        say(f"[{stamp}] no pictures/video on screen  |  {title[:70]}")
+                        say(f"[{stamp}] no pictures/video on screen", title)
             except KeyboardInterrupt:
                 raise
             except Exception as e:  # keep running through network hiccups / Space restarts

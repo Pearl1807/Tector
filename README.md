@@ -28,6 +28,17 @@ frame by frame, and on modern AI video (Google Veo 3) it caught only 1 of 8 clip
 - **Live web app:** https://huggingface.co/spaces/Miration/Tector
 - **Detector:** our own classifier, trained during the hackathon (91% accuracy on held-out images)
 
+## Who it's for
+
+- **Everyday social media users** scroll past hundreds of pictures a day. Nobody uploads each one to a
+  checking website, so Tector checks the screen for them, at the moment they see the picture.
+- **People targeted by fake profiles and scams.** AI-generated faces look like ordinary profile photos,
+  and they are Tector's strongest category (57 of 60 caught, 59 of 60 real faces passed).
+- **Journalists, moderators and fact-checkers** who want a quick first signal before verifying properly.
+
+The value: a warning at the moment of viewing, in whatever app you use, showing *which* picture was
+flagged, without uploading anything by hand.
+
 ## How it works
 
 ```
@@ -79,6 +90,71 @@ ADM, GLIDE, VQDM, Wukong, BigGAN, StyleGAN faces) from
 **Known limitations:** Video is checked frame by frame with the image model, and it has not been trained on AI video yet: on 8 Google Veo 3 clips it flagged only 1. `training/collect_video_frames.py` gathers Veo 3, Kling and real stock-footage frames for that next training round. Midjourney is the weakest image generator. About 5% of real photos score above the 70% alert
 level. Results are probabilities, not proof.
 
+## Testing & reliability
+
+**Model accuracy.** 340 held-out images from the datasets' validation splits, never seen in training:
+91% overall, broken down per generator above. We benchmarked six popular Hugging Face detectors first;
+the best reached 56% on the same test set. We also measured how the alert level trades off false
+alarms against missed AI images, and chose the levels from that:
+
+| Alert level | Real images wrongly flagged | AI images caught | Used for |
+|---|---|---|---|
+| 70% | 5.0% | 84% | the main picture on screen |
+| 85% | 2.1% | 74% | "Very likely" instead of "Possibly" |
+| 90% | 1.4% | 66% | thumbnails in grids |
+
+**End to end.** Every demo and example picture was checked on the live Space, both as a file and as it
+looks when shown full screen. The watcher was tested on photos opened in the Photos app, pictures in
+Chrome, and page layouts built to mimic TikTok, Pinterest and the Photos app.
+
+**Automated tests.** `python -m pytest tests` runs 10 tests of the watcher's screen logic: finding
+pictures on a page, trimming captions, ignoring icons, telling the main picture from a filmstrip or
+grid, recognising a picture already alerted on, and detecting screen changes.
+
+**Speed.** A check takes 4-7 s (down from 17-23 s, by sending only the main picture, downscaled to
+512 px). The alert card appears 0.07 s after a detection.
+
+**Cost.** The Space runs on Hugging Face's free CPU Basic hardware (Gradio Spaces need a Hugging Face
+PRO account, $9/month), so there is no cost per check. Upgrading to 8 CPUs ($0.03/hour) would roughly
+halve the delay. Training ran on a laptop CPU, with no GPU.
+
+**Failure modes and fallbacks.**
+
+| What goes wrong | What Tector does |
+|---|---|
+| No internet, or the Space is asleep or restarting | After 2 failed checks, a grey "Not protected" card warns the user; Tector keeps retrying, reconnects, and says "Protection is back on" |
+| No connection at start-up | Warns instead of crashing, retries every 10 s |
+| Windows hides notifications in full-screen apps | Tector shows its own always-on-top card |
+| The same picture or a playing video keeps triggering | Pictures are remembered by fingerprint; a playing video updates the card quietly |
+| A wrong answer | Alerts say "Very likely" or "Possibly", never a percentage, and never block anything |
+| Modern AI video | Not solved: 1 of 8 Veo 3 clips caught. Marked experimental; training data pipeline written |
+
+## Responsible AI & data
+
+**Privacy.** The watcher only runs after the user starts it, and says so with a "Watching your screen"
+card; closing the window stops it. It sends only the cropped picture (at most 512 px), and only when the
+screen changes, never the whole screen. The Space deletes uploaded images within about two minutes
+(`delete_cache`), never stores them and never uses them for training. The local log records scores
+only, not window titles. The crops do leave the device, which is why an on-device version is our next
+step.
+
+**Consent.** The web app's example real photos contain no identifiable people. The demo faces are
+either generated (StyleGAN, so no real person) or from the FFHQ research dataset.
+
+**Bias.** We measured accuracy per generator and report where Tector is weaker: Midjourney (12 of 20)
+and ordinary real photos (71 of 80 passed, against 79 of 80 for the off-the-shelf model). We did not
+audit face results across skin tone, age or gender, and don't claim fairness there.
+
+**Human oversight and safety.** Tector warns and never blocks, deletes or reports anything. The user
+decides. Results are probabilities, not proof: treating a false alarm as proof could wrongly discredit
+a real photo, so the wording stays cautious.
+
+**Data and licences.** Training and test data: Tiny-GenImage (CC BY-NC-SA 4.0) and 140k Real and Fake
+Faces (Creative Commons, see the dataset card), both non-commercial. The trained classifier should be
+retrained on commercially licensed data before any commercial use. The Veo 3 and Kling video sets state
+no licence, so we used a few clips only for evaluation and don't redistribute them. CLIP is MIT-licensed;
+our code is Apache 2.0. The example images in `examples/` come from these datasets.
+
 ## Project structure
 
 | Path | What it is |
@@ -91,6 +167,9 @@ level. Results are probabilities, not proof.
 | `training/collect_data.py` | Builds the training/test sets from Hugging Face datasets |
 | `training/extract_features.py` | Computes CLIP ViT-L/14 features |
 | `training/train_classifier.py` | Trains the classifier and reports held-out accuracy |
+| `training/collect_video_frames.py` | Collects AI and real video frames for the next training round |
+| `tests/test_watcher.py` | Automated tests of the watcher's screen logic |
+| `examples/` | One-click example images for the web app |
 
 ## Running it
 
@@ -119,12 +198,6 @@ python training/extract_features.py data/test test.npz
 python training/train_classifier.py train.npz test.npz tector_head.npz
 ```
 
-## Privacy
-
-The watcher sends only the cropped picture/video areas, and only when the screen changes, to the Tector
-Space for analysis. Tector itself keeps no copies or logs of what it sees. A fully on-device version
-(running the model locally) is the natural next step.
-
 ## Built with
 
-Hugging Face (Spaces, Transformers, Datasets, Hub), OpenAI CLIP, scikit-learn, Gradio, OpenCV, mss, winotify.
+Hugging Face (Spaces, Transformers, Datasets, Hub), OpenAI CLIP, scikit-learn, Gradio, OpenCV, mss, pytest.

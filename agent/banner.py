@@ -35,6 +35,7 @@ KINDS = {
     "alert": {"accent": (229, 72, 77), "on_accent": (255, 255, 255), "label": "High confidence"},
     "possible": {"accent": (247, 170, 40), "on_accent": (40, 24, 0), "label": "Medium confidence"},
     "info": {"accent": (79, 124, 255), "on_accent": (255, 255, 255), "label": ""},
+    "offline": {"accent": (113, 113, 122), "on_accent": (255, 255, 255), "label": "Not protected"},
 }
 FONTS = r"C:\Windows\Fonts"
 LOG_PATH = os.path.join(tempfile.gettempdir(), "tector_banner.log")
