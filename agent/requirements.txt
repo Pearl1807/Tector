@@ -1,0 +1,6 @@
+gradio_client
+mss>=10.2
+numpy
+opencv-python-headless<5
+pillow
+winotify

@@ -1,0 +1,203 @@
+"""Tector desktop watcher: runs in the background, checks what's on screen, and notifies the
+user when the active window appears to be showing AI-generated or deepfaked media.
+
+Usage:
+    python watcher.py --space <username>/<space-name> [--interval 5] [--threshold 0.7]
+"""
+import argparse
+import ctypes
+import ctypes.wintypes
+import os
+import tempfile
+import time
+import winreg
+
+import cv2
+import mss
+import numpy as np
+from gradio_client import Client, handle_file
+from PIL import Image, ImageChops, ImageStat
+from winotify import Notification, audio
+
+APP_ID = "Tector"
+MAX_SIDE = 1280  # downscale screenshots before upload to keep requests fast
+CHANGE_THRESHOLD = 4.0  # mean pixel difference (0-255) that counts as "screen changed"
+NOTIFY_COOLDOWN = 60  # seconds between alerts for the same app
+MAX_REGIONS = 6  # media areas checked per screen (e.g. pins in a Pinterest grid), sent as one batch
+SURE_THRESHOLD = 0.85  # alert on a single check at or above this; below it needs two checks in a row
+GRID_THRESHOLD = 0.9  # alert bar when several pictures are on screen (1.4% false alarms per picture vs 5% at 0.7)
+MIN_MEDIA_SIDE = 160  # px; smaller pictures (icons, avatars) are ignored
+MIN_MEDIA_FRACTION = 0.03  # of the window area
+MAX_FLAT_FRACTION = 0.35  # regions flatter than this are UI/text, not media
+
+user32 = ctypes.windll.user32
+user32.SetProcessDPIAware()  # so window coordinates match real screen pixels
+
+
+def register_app_id():
+    """Windows silently drops toasts from unregistered app IDs, so register ours (per-user, no admin)."""
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, rf"Software\Classes\AppUserModelId\{APP_ID}") as key:
+        winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, APP_ID)
+        winreg.SetValueEx(key, "ShowInSettings", 0, winreg.REG_DWORD, 1)
+
+
+def active_window():
+    """Returns (title, (left, top, right, bottom)) of the foreground window, or (title, None)."""
+    hwnd = user32.GetForegroundWindow()
+    length = user32.GetWindowTextLengthW(hwnd)
+    buf = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buf, length + 1)
+    rect = ctypes.wintypes.RECT()
+    if not hwnd or not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return buf.value, None
+    box = (rect.left, rect.top, rect.right, rect.bottom)
+    if box[2] - box[0] < 200 or box[3] - box[1] < 200:  # minimised or tiny window
+        return buf.value, None
+    return buf.value, box
+
+
+def capture(sct):
+    """Screenshot of the active window (falls back to the primary monitor)."""
+    title, box = active_window()
+    mon = sct.monitors[1]
+    if box:
+        region = {"left": box[0], "top": box[1], "width": box[2] - box[0], "height": box[3] - box[1]}
+    else:
+        region = mon
+    shot = sct.grab(region)
+    return title or "Screen", Image.frombytes("RGB", shot.size, shot.rgb)
+
+
+def trim_flat_edges(std, box):
+    """Shrinks a box while its outer rows/columns are mostly flat, e.g. a caption under a Pinterest pin."""
+    x0, y0, x1, y1 = box
+    flat = std <= 1
+    while y1 - y0 > MIN_MEDIA_SIDE and flat[y1 - 1, x0:x1].mean() > 0.5:
+        y1 -= 1
+    while y1 - y0 > MIN_MEDIA_SIDE and flat[y0, x0:x1].mean() > 0.5:
+        y0 += 1
+    while x1 - x0 > MIN_MEDIA_SIDE and flat[y0:y1, x1 - 1].mean() > 0.5:
+        x1 -= 1
+    while x1 - x0 > MIN_MEDIA_SIDE and flat[y0:y1, x0].mean() > 0.5:
+        x0 += 1
+    return x0, y0, x1, y1
+
+
+def media_regions(img):
+    """Finds the picture/video areas in a screenshot, largest first.
+
+    The detector was trained on clean single images; toolbars, text and other page content
+    around a picture skew its score badly, so we only send the media itself.
+    UI and text areas sit on flat backgrounds, photos and video frames have texture everywhere.
+    """
+    gray = np.asarray(img.convert("L"), dtype=np.float32)
+    mean = cv2.blur(gray, (5, 5))
+    std = np.sqrt(np.maximum(cv2.blur(gray * gray, (5, 5)) - mean * mean, 0))
+    busy = (std > 2).astype(np.uint8)
+    busy = cv2.morphologyEx(busy, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    busy = cv2.morphologyEx(busy, cv2.MORPH_OPEN, np.ones((31, 31), np.uint8))  # drop thin text lines
+    contours, _ = cv2.findContours(busy, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    min_area = MIN_MEDIA_FRACTION * img.width * img.height
+    boxes = []
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        if w < MIN_MEDIA_SIDE or h < MIN_MEDIA_SIDE or w * h < min_area:
+            continue
+        flat = (std[y:y + h, x:x + w] <= 1).mean()  # text blocks are mostly flat background
+        if flat < MAX_FLAT_FRACTION:
+            box = trim_flat_edges(std, (x, y, x + w, y + h))
+            if box[2] - box[0] >= MIN_MEDIA_SIDE and box[3] - box[1] >= MIN_MEDIA_SIDE:
+                boxes.append(box)
+    boxes.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
+    return boxes[:MAX_REGIONS]
+
+
+def check_regions(client, img, boxes, tmp_dir):
+    """Sends all media areas to the Space in one request; returns the highest AI probability."""
+    paths = []
+    for i, box in enumerate(boxes):
+        crop = img.crop(box)
+        crop.thumbnail((MAX_SIDE, MAX_SIDE))
+        path = os.path.join(tmp_dir, f"tector_region_{i}.jpg")
+        crop.save(path, quality=95)
+        paths.append(handle_file(path))
+    return max(client.predict(paths, api_name="/detect_batch")["probs"])
+
+
+def changed(prev, img):
+    if prev is None:
+        return True
+    a = prev.convert("L").resize((64, 36))
+    b = img.convert("L").resize((64, 36))
+    return ImageStat.Stat(ImageChops.difference(a, b)).mean[0] > CHANGE_THRESHOLD
+
+
+def notify(title, prob):
+    toast = Notification(
+        app_id=APP_ID,
+        title="⚠️ AI-generated media detected",
+        msg=f"{prob:.0%} likely AI in \"{title[:60]}\". Be careful what you trust or share.",
+        duration="long",
+    )
+    toast.set_audio(audio.Default, loop=False)
+    toast.show()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--space", required=True, help="Hugging Face Space id (user/name) or URL")
+    parser.add_argument("--interval", type=float, default=5, help="seconds between screen checks")
+    parser.add_argument("--threshold", type=float, default=0.7, help="alert when AI probability >= this")
+    parser.add_argument("--once", action="store_true", help="check the screen once and exit")
+    args = parser.parse_args()
+
+    register_app_id()
+    print(f"Connecting to {args.space} ...")
+    client = Client(args.space, verbose=False)
+    print(f"Watching your screen every {args.interval:g}s (alert at {args.threshold:.0%}). Ctrl+C to stop.")
+    Notification(app_id=APP_ID, title="Tector is watching",
+                 msg="You'll get an alert if AI-generated media shows up on screen.").show()
+
+    tmp_dir = tempfile.gettempdir()
+    prev, last_alert, suspicious = None, {}, {}  # suspicious: window title -> previous check was over threshold
+    with mss.MSS() as sct:
+        while True:
+            try:
+                title, img = capture(sct)
+                if changed(prev, img):
+                    prev = img
+                    stamp = time.strftime("%H:%M:%S")
+                    boxes = media_regions(img)
+                    if boxes:
+                        prob = check_regions(client, img, boxes, tmp_dir)
+                        # Each picture has a small false-alarm chance, so a grid of many needs a stricter bar
+                        bar = args.threshold if len(boxes) == 1 else max(args.threshold, GRID_THRESHOLD)
+                        over = prob >= bar
+                        # Very confident -> alert now. Borderline -> needs a second check in a row to agree
+                        # (the next video frame, or a re-check of a still image) so one odd frame can't alert.
+                        confirmed = over and (prob >= SURE_THRESHOLD or suspicious.get(title, False))
+                        note = "  (checking again to confirm)" if over and not confirmed else ""
+                        print(f"[{stamp}] {prob:.0%} AI ({len(boxes)} media area(s))  |  {title[:60]}{note}")
+                        suspicious[title] = over and not confirmed
+                        if suspicious[title]:
+                            prev = None  # force a re-check even if the screen doesn't change
+                        if confirmed and time.time() - last_alert.get(title, 0) > NOTIFY_COOLDOWN:
+                            last_alert[title] = time.time()
+                            notify(title, prob)
+                    else:
+                        suspicious[title] = False
+                        print(f"[{stamp}] no pictures/video on screen  |  {title[:70]}")
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:  # keep running through network hiccups / Space restarts
+                print(f"[{time.strftime('%H:%M:%S')}] check failed: {e}")
+            if args.once:
+                break
+            time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nStopped.")

@@ -1,0 +1,5 @@
+transformers
+torch
+opencv-python-headless<5
+pillow
+numpy
