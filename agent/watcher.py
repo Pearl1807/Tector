@@ -24,13 +24,16 @@ from PIL import Image, ImageChops, ImageStat
 APP_ID = "Tector"
 BANNER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "banner.py")
 LOG_PATH = os.path.join(tempfile.gettempdir(), "tector.log")
+OWN_WINDOWS = {"Tector alert", "tk"}  # our alert card: never scan it
 MAX_SIDE = 512  # crops are downscaled before upload; the model only looks at 224px, and big uploads lag (4-11s vs 3.5s)
 CHANGE_THRESHOLD = 4.0  # mean pixel difference (0-255) that counts as "screen changed"
 WINDOW_COOLDOWN = 15  # min seconds between alerts for the same app (stops a playing AI video from spamming)
 IMAGE_MEMORY = 600  # seconds we remember an image we already alerted on, so scrolling back doesn't re-alert
 MAX_REGIONS = 6  # media areas checked per screen (e.g. pins in a Pinterest grid), sent as one batch
 SURE_THRESHOLD = 0.85  # alert on a single check at or above this; below it needs two checks in a row
-GRID_THRESHOLD = 0.9  # alert bar when several pictures are on screen (1.4% false alarms per picture vs 5% at 0.7)
+GRID_THRESHOLD = 0.9  # alert bar for thumbnails among several pictures (1.4% false alarms per picture vs 5% at 0.7)
+MAIN_MEDIA_FRACTION = 0.12  # a picture covering this much of the window is what the user is looking at
+MAIN_MEDIA_DOMINANCE = 2.5  # ...or one this many times bigger than any other picture on screen
 MIN_MEDIA_SIDE = 160  # px; smaller pictures (icons, avatars) are ignored
 MIN_MEDIA_FRACTION = 0.03  # of the window area
 MAX_FLAT_FRACTION = 0.35  # regions flatter than this are UI/text, not media
@@ -118,7 +121,7 @@ def media_regions(img):
 
 
 def check_regions(client, img, boxes, tmp_dir):
-    """Sends all media areas to the Space in one request; returns (highest AI probability, that crop)."""
+    """Sends all media areas to the Space in one request; returns [(AI probability, crop, box), ...]."""
     crops, paths = [], []
     for i, box in enumerate(boxes):
         crop = img.crop(box)
@@ -128,8 +131,20 @@ def check_regions(client, img, boxes, tmp_dir):
         crops.append(crop)
         paths.append(handle_file(path))
     probs = client.predict(paths, api_name="/detect_batch")["probs"]
-    best = int(np.argmax(probs))
-    return probs[best], crops[best]
+    return list(zip(probs, crops, boxes))
+
+
+def box_area(box):
+    return (box[2] - box[0]) * (box[3] - box[1])
+
+
+def is_main_media(box, img, boxes):
+    """The picture/video the user is actually looking at, as opposed to thumbnails in a grid or filmstrip:
+    the only one, a big one, or one much bigger than everything else (e.g. Photos app with its filmstrip)."""
+    if len(boxes) == 1 or box_area(box) >= MAIN_MEDIA_FRACTION * img.width * img.height:
+        return True
+    areas = sorted((box_area(b) for b in boxes), reverse=True)
+    return box_area(box) == areas[0] and areas[0] >= MAIN_MEDIA_DOMINANCE * areas[1]
 
 
 def say(msg):
@@ -221,20 +236,26 @@ def main():
         while True:
             try:
                 title, img = capture(sct)
-                if changed(prev, img):
+                if title not in OWN_WINDOWS and changed(prev, img):
                     prev = img
                     stamp = time.strftime("%H:%M:%S")
                     boxes = media_regions(img)
                     if boxes:
-                        prob, crop = check_regions(client, img, boxes, tmp_dir)
-                        # Each picture has a small false-alarm chance, so a grid of many needs a stricter bar
-                        bar = args.threshold if len(boxes) == 1 else max(args.threshold, GRID_THRESHOLD)
-                        over = prob >= bar
+                        # The main picture uses the normal bar. Small thumbnails (Pinterest grid, Photos filmstrip)
+                        # each carry a small false-alarm chance, so they need a stricter one.
+                        def bar_for(box):
+                            main = is_main_media(box, img, boxes)
+                            return args.threshold if main else max(args.threshold, GRID_THRESHOLD)
+
+                        results = check_regions(client, img, boxes, tmp_dir)
+                        prob, crop, box = max(results, key=lambda r: r[0] - bar_for(r[2]))
+                        over = prob >= bar_for(box)
                         # Very confident -> alert now. Borderline -> needs a second check in a row to agree
                         # (the next video frame, or a re-check of a still image) so one odd frame can't alert.
                         confirmed = over and (prob >= SURE_THRESHOLD or suspicious.get(title, False))
                         note = "  (checking again to confirm)" if over and not confirmed else ""
-                        say(f"[{stamp}] {prob:.0%} AI ({len(boxes)} media area(s))  |  {title[:60]}{note}")
+                        kind = "main picture" if is_main_media(box, img, boxes) else "thumbnail"
+                        say(f"[{stamp}] {prob:.0%} AI ({kind}, {len(boxes)} media area(s))  |  {title[:60]}{note}")
                         suspicious[title] = over and not confirmed
                         if suspicious[title]:
                             prev = None  # force a re-check even if the screen doesn't change

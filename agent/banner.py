@@ -148,12 +148,15 @@ def render_card(kind, title, message, image_path, scale):
     return card
 
 
-def round_window_corners(root):
-    """Windows 11 rounded corners (ignored on Windows 10)."""
+def style_window(root):
+    """Windows 11 rounded corners, and never take focus from the app the user is watching."""
     try:
-        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
-        pref = ctypes.c_int(2)  # DWMWCP_ROUND
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetParent(root.winfo_id())
+        pref = ctypes.c_int(2)  # DWMWCP_ROUND (ignored on Windows 10)
         ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(pref), ctypes.sizeof(pref))
+        GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW = -20, 0x08000000, 0x00000080
+        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, user32.GetWindowLongW(hwnd, GWL_EXSTYLE) | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
     except (AttributeError, OSError):
         pass
 
@@ -171,7 +174,9 @@ def main():
     except (AttributeError, OSError):
         pass
 
+    previous_foreground = ctypes.windll.user32.GetForegroundWindow()
     root = tk.Tk()
+    root.title("Tector alert")  # the watcher skips this window
     root.overrideredirect(True)
     root.attributes("-topmost", True)
     root.attributes("-alpha", 0.0)
@@ -191,7 +196,7 @@ def main():
     start_x = end_x + px(60)
     root.geometry(f"{w}x{h}+{start_x}+{y}")
     root.update_idletasks()
-    round_window_corners(root)
+    style_window(root)
 
     log(f"show kind={args.kind} at {end_x},{y} size {w}x{h} screen {root.winfo_screenwidth()}x"
         f"{root.winfo_screenheight()} scale {scale:.2f}")
@@ -234,6 +239,8 @@ def main():
 
     if args.kind != "info":
         winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+    # Tk activates its window when it appears; hand focus straight back to the app the user was using
+    root.after(50, lambda: ctypes.windll.user32.SetForegroundWindow(previous_foreground))
     slide_in()
     tick()
     root.mainloop()
