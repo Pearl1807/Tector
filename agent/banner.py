@@ -9,7 +9,9 @@ Usage:
 import argparse
 import ctypes
 import os
+import queue
 import tempfile
+import threading
 import time
 import tkinter as tk
 import traceback
@@ -35,6 +37,7 @@ KINDS = {
 }
 FONTS = r"C:\Windows\Fonts"
 LOG_PATH = os.path.join(tempfile.gettempdir(), "tector_banner.log")
+CARD_TITLE = "Tector alert"
 
 
 def log(msg):
@@ -86,7 +89,7 @@ def wrap(draw, text, fnt, width):
     return lines
 
 
-def render_card(kind, title, message, image_path, scale):
+def render_card(kind, title, message, image, scale):
     """Draws the static card with Pillow (anti-aliased text and shapes)."""
     k = KINDS[kind]
     accent = k["accent"]
@@ -102,8 +105,8 @@ def render_card(kind, title, message, image_path, scale):
 
     # thumbnail of the flagged picture (or a logo tile for info cards)
     tx, ty, ts = px(PAD), px(PAD), px(THUMB)
-    if image_path:
-        thumb = Image.open(image_path).convert("RGB")
+    if image is not None:
+        thumb = (image if isinstance(image, Image.Image) else Image.open(image)).convert("RGB")
         side = min(thumb.size)
         thumb = thumb.crop(((thumb.width - side) // 2, (thumb.height - side) // 2,
                             (thumb.width + side) // 2, (thumb.height + side) // 2)).resize((ts, ts), Image.LANCZOS)
@@ -148,11 +151,11 @@ def render_card(kind, title, message, image_path, scale):
     return card
 
 
-def style_window(root):
-    """Windows 11 rounded corners, and never take focus from the app the user is watching."""
+def style_window(win):
+    """Windows 11 rounded corners, no taskbar button, and don't take focus when clicked."""
     try:
         user32 = ctypes.windll.user32
-        hwnd = user32.GetParent(root.winfo_id())
+        hwnd = user32.GetParent(win.winfo_id())
         pref = ctypes.c_int(2)  # DWMWCP_ROUND (ignored on Windows 10)
         ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(pref), ctypes.sizeof(pref))
         GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW = -20, 0x08000000, 0x00000080
@@ -161,89 +164,165 @@ def style_window(root):
         pass
 
 
+def show_without_focus(win):
+    """Shows the window on top without activating it (Tk's own deiconify would steal focus from a video)."""
+    user32 = ctypes.windll.user32
+    hwnd = user32.GetParent(win.winfo_id())
+    SW_SHOWNOACTIVATE, HWND_TOPMOST = 4, -1
+    SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x1, 0x2, 0x10
+    user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+    user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+
+
+class Card:
+    """One on-screen card. A new alert while it is showing replaces its content instead of stacking."""
+
+    def __init__(self, root, scale, on_closed):
+        self.root, self.scale, self.on_closed = root, scale, on_closed
+        px = self.px
+        self.w, self.h = px(W), px(H)
+
+        self.win = tk.Toplevel(root)
+        self.win.withdraw()  # shown below without taking focus from the user's app
+        self.win.title(CARD_TITLE)  # the watcher skips this window
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.attributes("-alpha", 0.0)
+        self.canvas = tk.Canvas(self.win, width=self.w, height=self.h, highlightthickness=0, bd=0)
+        self.canvas.pack()
+        self.image_item = self.canvas.create_image(0, 0, anchor="nw")
+        self.bar = self.canvas.create_rectangle(0, self.h - px(3), self.w, self.h, width=0)
+
+        self.end_x = root.winfo_screenwidth() - self.w - px(24)
+        self.start_x = self.end_x + px(60)
+        self.y = root.winfo_screenheight() - self.h - px(72)  # above the taskbar
+        self.win.geometry(f"{self.w}x{self.h}+{self.start_x}+{self.y}")
+        self.win.update_idletasks()
+        style_window(self.win)
+        show_without_focus(self.win)
+
+        self.left, self.elapsed, self.hover, self.closing = SHOW_MS, 0, False, False
+        self.canvas.bind("<Enter>", lambda _e: setattr(self, "hover", True))  # pause countdown on hover
+        self.canvas.bind("<Leave>", lambda _e: setattr(self, "hover", False))
+        self.canvas.bind("<Button-1>", lambda _e: self.close())
+        self._slide_in()
+        self._tick()
+
+    def px(self, v):
+        return int(round(v * self.scale))
+
+    def set_content(self, kind, title, message, image):
+        self.photo = ImageTk.PhotoImage(render_card(kind, title, message, image, self.scale))
+        self.canvas.itemconfigure(self.image_item, image=self.photo)
+        self.canvas.itemconfigure(self.bar, fill="#%02x%02x%02x" % KINDS[kind]["accent"])
+        self.canvas.tag_raise(self.bar)
+        self.left, self.elapsed = SHOW_MS, 0  # restart the countdown
+        if self.closing:  # a new alert arrived while fading out: bring the card back
+            self.closing = False
+            self.win.attributes("-alpha", 0.97)
+            self._tick()
+
+    def _slide_in(self, step=0, steps=12):
+        ease = 1 - (1 - step / steps) ** 3
+        self.win.geometry(f"+{int(self.start_x + (self.end_x - self.start_x) * ease)}+{self.y}")
+        self.win.attributes("-alpha", 0.97 * ease)
+        if step < steps:
+            self.win.after(15, self._slide_in, step + 1)
+
+    def _tick(self):
+        if self.closing:
+            return
+        self.elapsed += 50
+        # Hovering pauses the countdown, but never for more than MAX_HOVER_MS (a mouse resting in the corner)
+        if not self.hover or self.elapsed > SHOW_MS + MAX_HOVER_MS:
+            self.left -= 50
+        self.canvas.coords(self.bar, 0, self.h - self.px(3), self.w * max(0, self.left) / SHOW_MS, self.h)
+        if self.left <= 0:
+            self.close()
+        else:
+            self.win.after(50, self._tick)
+
+    def close(self, step=0, steps=10):
+        if step == 0 and self.closing:
+            return
+        self.closing = True
+        if step < steps:
+            self.win.attributes("-alpha", 0.97 * (1 - step / steps))
+            self.win.after(16, self._continue_close, step + 1, steps)
+        else:
+            self.win.destroy()
+            self.on_closed(self)
+
+    def _continue_close(self, step, steps):
+        if self.closing:  # cancelled if new content arrived meanwhile
+            self.close(step, steps)
+
+
+class Notifier:
+    """Shows Tector's alert cards from a background Tk thread inside the watcher: no process start-up
+    delay, and one card at a time that updates in place when something new is detected."""
+
+    def __init__(self):
+        self.requests = queue.Queue()
+        self.card, self.card_key = None, None
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def show(self, kind, title, message, image=None, key=None, sound=True):
+        """Thread-safe. `key` identifies the source (e.g. app + screen position); while a card is up, an
+        alert from the same source updates it silently, a different source updates it with a sound."""
+        self.requests.put((kind, title, message, image, key, sound))
+
+    def _run(self):
+        user_app = ctypes.windll.user32.GetForegroundWindow()
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.update()
+        ctypes.windll.user32.SetForegroundWindow(user_app)  # creating Tk grabs focus; give it back
+        self.scale = self.root.winfo_fpixels("1i") / 96
+        self.root.report_callback_exception = lambda *exc: log("error: " + "".join(traceback.format_exception(*exc)))
+        self._poll()
+        self.root.mainloop()
+
+    def _poll(self):
+        try:
+            while True:
+                self._present(*self.requests.get_nowait())
+        except queue.Empty:
+            pass
+        self.root.after(30, self._poll)
+
+    def _present(self, kind, title, message, image, key, sound):
+        showing = self.card is not None and not self.card.closing
+        if showing:
+            sound = sound and key != self.card_key
+        if self.card is None:
+            self.card = Card(self.root, self.scale, self._closed)
+        self.card.set_content(kind, title, message, image)
+        self.card_key = key
+        if sound and kind != "info":
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        log(f"{'updated' if showing else 'shown'} {kind}: {title}")
+
+    def _closed(self, card):
+        if self.card is card:
+            self.card, self.card_key = None, None
+
+
 def main():
+    """Standalone demo: python banner.py --kind alert --title ... --message ... [--image path]"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--kind", choices=KINDS, default="alert")
     parser.add_argument("--title", required=True)
     parser.add_argument("--message", required=True)
     parser.add_argument("--image")
     args = parser.parse_args()
-
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # crisp rendering on high-DPI screens
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except (AttributeError, OSError):
         pass
-
-    previous_foreground = ctypes.windll.user32.GetForegroundWindow()
-    root = tk.Tk()
-    root.title("Tector alert")  # the watcher skips this window
-    root.overrideredirect(True)
-    root.attributes("-topmost", True)
-    root.attributes("-alpha", 0.0)
-    scale = root.winfo_fpixels("1i") / 96
-    px = lambda v: int(round(v * scale))  # noqa: E731
-    w, h = px(W), px(H)
-
-    photo = ImageTk.PhotoImage(render_card(args.kind, args.title, args.message, args.image, scale))
-    canvas = tk.Canvas(root, width=w, height=h, highlightthickness=0, bd=0)
-    canvas.pack()
-    canvas.create_image(0, 0, image=photo, anchor="nw")
-    accent = "#%02x%02x%02x" % KINDS[args.kind]["accent"]
-    bar = canvas.create_rectangle(0, h - px(3), w, h, fill=accent, width=0)
-
-    end_x = root.winfo_screenwidth() - w - px(24)
-    y = root.winfo_screenheight() - h - px(72)  # above the taskbar
-    start_x = end_x + px(60)
-    root.geometry(f"{w}x{h}+{start_x}+{y}")
-    root.update_idletasks()
-    style_window(root)
-
-    log(f"show kind={args.kind} at {end_x},{y} size {w}x{h} screen {root.winfo_screenwidth()}x"
-        f"{root.winfo_screenheight()} scale {scale:.2f}")
-    root.report_callback_exception = lambda *exc: log("error: " + "".join(traceback.format_exception(*exc)))
-    state = {"left": SHOW_MS, "hover": False, "closing": False, "ticks": 0}
-
-    def slide_in(step=0, steps=14):
-        t = step / steps
-        ease = 1 - (1 - t) ** 3
-        root.geometry(f"+{int(start_x + (end_x - start_x) * ease)}+{y}")
-        root.attributes("-alpha", 0.97 * ease)
-        if step < steps:
-            root.after(16, slide_in, step + 1)
-
-    def close(step=0, steps=10):
-        state["closing"] = True
-        root.attributes("-alpha", 0.97 * (1 - step / steps))
-        if step < steps:
-            root.after(16, close, step + 1)
-        else:
-            log("closed")
-            root.destroy()
-
-    def tick():
-        if state["closing"]:
-            return
-        state["ticks"] += 1
-        # Hovering pauses the countdown, but never for more than MAX_HOVER_MS (a mouse resting in the corner)
-        if not state["hover"] or state["ticks"] * 50 > SHOW_MS + MAX_HOVER_MS:
-            state["left"] -= 50
-        canvas.coords(bar, 0, h - px(3), w * max(0, state["left"]) / SHOW_MS, h)
-        if state["left"] <= 0:
-            close()
-        else:
-            root.after(50, tick)
-
-    canvas.bind("<Enter>", lambda _e: state.update(hover=True))  # pause the countdown while hovered
-    canvas.bind("<Leave>", lambda _e: state.update(hover=False))
-    canvas.bind("<Button-1>", lambda _e: state["closing"] or close())
-
-    if args.kind != "info":
-        winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-    # Tk activates its window when it appears; hand focus straight back to the app the user was using
-    root.after(50, lambda: ctypes.windll.user32.SetForegroundWindow(previous_foreground))
-    slide_in()
-    tick()
-    root.mainloop()
+    notifier = Notifier()
+    notifier.show(args.kind, args.title, args.message, args.image)
+    time.sleep((SHOW_MS + MAX_HOVER_MS) / 1000 + 1)
 
 
 if __name__ == "__main__":

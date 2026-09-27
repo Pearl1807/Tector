@@ -37,9 +37,13 @@ A web app lets anyone upload an image or video to check it.
 **Why crop to the media?** Sending the whole window confused the detector: a real photo inside a web page
 scored 92% AI, and a small AI image scored only 30%. Cropping to just the picture fixed both.
 
-**Why confirm before alerting?** One odd video frame shouldn't cause an alert. A score of 85% or more alerts
-immediately. A score of 70–85% must be confirmed by the next check. When many pictures are on screen
-(e.g. a Pinterest grid), each picture must reach 90%, to keep false alarms low.
+**Fast, focused checks.** When there is a main picture or video on screen (a photo you opened, a TikTok
+video), only that is checked, so an alert appears about 4-6 seconds after it shows up. Otherwise up to 4
+thumbnails are checked, and each must reach 90% (instead of 70%) to keep false alarms low in grids.
+
+**One card, always up to date.** The alert card appears instantly. If you move to another AI picture or
+video while it is showing, the same card updates with the new picture instead of stacking a second one.
+It never takes focus from the app you are using, and a video that keeps playing updates it quietly.
 
 ## Our detector
 

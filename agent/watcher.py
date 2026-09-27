@@ -2,14 +2,13 @@
 user when the active window appears to be showing AI-generated or deepfaked media.
 
 Usage:
-    python watcher.py --space <username>/<space-name> [--interval 5] [--threshold 0.7]
+    python watcher.py --space <username>/<space-name> [--interval 1] [--threshold 0.7]
 """
 import argparse
 import ctypes
 import ctypes.wintypes
 import os
 import subprocess
-import sys
 import tempfile
 import time
 import winreg
@@ -21,16 +20,18 @@ import numpy as np
 from gradio_client import Client, handle_file
 from PIL import Image, ImageChops, ImageStat
 
+from banner import CARD_TITLE, Notifier
+
 APP_ID = "Tector"
-BANNER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "banner.py")
 LOG_PATH = os.path.join(tempfile.gettempdir(), "tector.log")
-OWN_WINDOWS = {"Tector alert", "tk"}  # our alert card: never scan it
+OWN_WINDOWS = {CARD_TITLE, "tk"}  # our alert card: never scan it
 MAX_SIDE = 512  # crops are downscaled before upload; the model only looks at 224px, and big uploads lag (4-11s vs 3.5s)
 CHANGE_THRESHOLD = 4.0  # mean pixel difference (0-255) that counts as "screen changed"
-WINDOW_COOLDOWN = 15  # min seconds between alerts for the same app (stops a playing AI video from spamming)
+SOURCE_QUIET = 30  # an AI video still playing in the same spot re-alerts quietly (no sound) for this long
 IMAGE_MEMORY = 600  # seconds we remember an image we already alerted on, so scrolling back doesn't re-alert
-MAX_REGIONS = 6  # media areas checked per screen (e.g. pins in a Pinterest grid), sent as one batch
-SURE_THRESHOLD = 0.85  # alert on a single check at or above this; below it needs two checks in a row
+MAX_REGIONS = 6  # media areas found per screen
+MAX_GRID_CHECK = 4  # thumbnails checked per screen when there is no main picture (each adds time)
+SURE_THRESHOLD = 0.85  # "Very likely" at or above this, "Possibly" below
 GRID_THRESHOLD = 0.9  # alert bar for thumbnails among several pictures (1.4% false alarms per picture vs 5% at 0.7)
 MAIN_MEDIA_FRACTION = 0.12  # a picture covering this much of the window is what the user is looking at
 MAIN_MEDIA_DOMINANCE = 2.5  # ...or one this many times bigger than any other picture on screen
@@ -175,14 +176,6 @@ def changed(prev, img):
     return ImageStat.Stat(ImageChops.difference(a, b)).mean[0] > CHANGE_THRESHOLD
 
 
-def show_card(kind, title, message, image_path=None):
-    """Tector's own alert card (agent/banner.py): branded, and visible over full-screen apps."""
-    cmd = [sys.executable, BANNER_SCRIPT, "--kind", kind, "--title", title, "--message", message]
-    if image_path:
-        cmd += ["--image", image_path]
-    subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
-
-
 def record_in_notification_center(title, message):
     """Adds a silent entry to the Windows notification centre (no pop-up) so alerts keep a history."""
     xml = (f'<toast><visual><binding template="ToastGeneric"><text>{escape(title)}</text>'
@@ -202,82 +195,79 @@ $toast.SuppressPopup = $true
                      creationflags=subprocess.CREATE_NO_WINDOW)
 
 
-def notify(title, prob, crop, tmp_dir):
+def notify(notifier, title, prob, crop, key, sound):
     # Plain words instead of a percentage: the score isn't a calibrated probability, and "93%" suggests
     # more precision than the model has.
     sure = prob >= SURE_THRESHOLD
     headline = "Very likely AI-generated" if sure else "Possibly AI-generated"
     app = title if len(title) <= 40 else title[:39] + "…"
     message = f"Seen in \"{app}\". Think twice before trusting or sharing it."
-    image_path = os.path.join(tmp_dir, f"tector_flagged_{int(time.time())}.jpg")
-    crop.save(image_path, quality=90)
-    show_card("alert" if sure else "possible", headline, message, image_path)
+    notifier.show("alert" if sure else "possible", headline, message, image=crop.copy(), key=key, sound=sound)
     record_in_notification_center(f"⚠️ {headline}", message)
+
+
+def source_key(title, box):
+    """Identifies where a detection came from: same app and same spot on screen = same video/picture slot."""
+    return title, tuple(v // 50 for v in box)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--space", required=True, help="Hugging Face Space id (user/name) or URL")
-    parser.add_argument("--interval", type=float, default=2, help="seconds to wait between screen checks")
+    parser.add_argument("--interval", type=float, default=1, help="seconds to wait between screen checks")
     parser.add_argument("--threshold", type=float, default=0.7, help="alert when AI probability >= this")
     parser.add_argument("--once", action="store_true", help="check the screen once and exit")
     args = parser.parse_args()
 
     register_app_id()
+    notifier = Notifier()
     say(f"Connecting to {args.space} ...")
     client = Client(args.space, verbose=False)
-    say(f"Watching your screen every {args.interval:g}s (alert at {args.threshold:.0%}). Ctrl+C to stop.")
-    show_card("info", "Tector is watching", "You'll get an alert if AI-generated media shows up on screen.")
+    say(f"Watching your screen (alert at {args.threshold:.0%}). Ctrl+C to stop.")
+    notifier.show("info", "Tector is watching", "You'll get an alert if AI-generated media shows up on screen.")
 
     tmp_dir = tempfile.gettempdir()
-    prev, last_alert, suspicious = None, {}, {}  # suspicious: window title -> previous check was over threshold
+    prev = None
     alerted = []  # (fingerprint, time) of pictures we already alerted on
+    last_sound = {}  # source key -> time we last alerted with sound
     with mss.MSS() as sct:
         while True:
             try:
                 title, img = capture(sct)
                 if title not in OWN_WINDOWS and changed(prev, img):
                     prev = img
-                    stamp = time.strftime("%H:%M:%S")
+                    stamp, started = time.strftime("%H:%M:%S"), time.time()
                     boxes = media_regions(img)
+                    main_boxes = [b for b in boxes if is_main_media(b, img, boxes)]
                     if boxes:
-                        # The main picture uses the normal bar. Small thumbnails (Pinterest grid, Photos filmstrip)
-                        # each carry a small false-alarm chance, so they need a stricter one.
-                        def bar_for(box):
-                            main = is_main_media(box, img, boxes)
-                            return args.threshold if main else max(args.threshold, GRID_THRESHOLD)
-
-                        results = check_regions(client, img, boxes, tmp_dir)
-                        prob, crop, box = max(results, key=lambda r: r[0] - bar_for(r[2]))
-                        over = prob >= bar_for(box)
-                        # Very confident -> alert now. Borderline -> needs a second check in a row to agree
-                        # (the next video frame, or a re-check of a still image) so one odd frame can't alert.
-                        confirmed = over and (prob >= SURE_THRESHOLD or suspicious.get(title, False))
-                        note = "  (checking again to confirm)" if over and not confirmed else ""
-                        kind = "main picture" if is_main_media(box, img, boxes) else "thumbnail"
-                        say(f"[{stamp}] {prob:.0%} AI ({kind}, {len(boxes)} media area(s))  |  {title[:60]}{note}")
-                        suspicious[title] = over and not confirmed
-                        if suspicious[title]:
-                            prev = None  # force a re-check even if the screen doesn't change
-                        if confirmed:
-                            now, fp = time.time(), fingerprint(crop)
+                        # Only the picture/video the user is looking at when there is one (fast), otherwise the
+                        # biggest few thumbnails. Thumbnails each carry a small false-alarm chance, so they
+                        # need a stricter bar.
+                        to_check = main_boxes[:1] or boxes[:MAX_GRID_CHECK]
+                        bar = args.threshold if main_boxes else max(args.threshold, GRID_THRESHOLD)
+                        prob, crop, box = max(check_regions(client, img, to_check, tmp_dir), key=lambda r: r[0])
+                        kind = "main picture" if main_boxes else f"best of {len(to_check)} thumbnails"
+                        say(f"[{stamp}] {prob:.0%} AI ({kind}, {time.time() - started:.1f}s)  |  {title[:60]}")
+                        if prob >= bar:
+                            now, fp, key = time.time(), fingerprint(crop), source_key(title, box)
                             if already_alerted(fp, alerted, now):
                                 say("           (already alerted for this picture)")
-                            elif now - last_alert.get(title, 0) < WINDOW_COOLDOWN:
-                                say(f"           (alerted for this app {now - last_alert[title]:.0f}s ago, staying quiet)")
                             else:
-                                last_alert[title] = now
                                 alerted.append((fp, now))
-                                notify(title, prob, crop, tmp_dir)
-                                say("           >>> notification sent")
+                                # Same video/slot alerted recently -> update the card quietly; new source -> sound
+                                sound = now - last_sound.get(key, 0) > SOURCE_QUIET
+                                if sound:
+                                    last_sound[key] = now
+                                notify(notifier, title, prob, crop, key, sound)
+                                say(f"           >>> alert shown{'' if sound else ' (quietly, same source)'}")
                     else:
-                        suspicious[title] = False
                         say(f"[{stamp}] no pictures/video on screen  |  {title[:70]}")
             except KeyboardInterrupt:
                 raise
             except Exception as e:  # keep running through network hiccups / Space restarts
                 say(f"[{time.strftime('%H:%M:%S')}] check failed: {e}")
             if args.once:
+                time.sleep(1)  # let the card appear before exiting
                 break
             time.sleep(args.interval)
 
