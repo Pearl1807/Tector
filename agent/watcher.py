@@ -224,7 +224,7 @@ def main():
     say(f"Connecting to {args.space} ...")
     client = Client(args.space, verbose=False)
     say(f"Watching your screen (alert at {args.threshold:.0%}). Ctrl+C to stop.")
-    notifier.show("info", "Tector is watching", "You'll get an alert if AI-generated media shows up on screen.")
+    notifier.show("info", "Watching your screen", "You'll get an alert if AI-generated media shows up.")
 
     tmp_dir = tempfile.gettempdir()
     prev = None

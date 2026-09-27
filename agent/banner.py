@@ -17,23 +17,24 @@ import tkinter as tk
 import traceback
 import winsound
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageTk
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 SHOW_MS = 8000
 MAX_HOVER_MS = 12000
-W, H = 460, 148  # logical size; scaled for the screen's DPI
-PAD, THUMB = 16, 116
+W, H = 420, 128  # logical size; scaled for the screen's DPI
+PAD, THUMB = 16, 96
 SS = 2  # supersampling factor for smooth shapes
 
-BG = (18, 19, 26)
-BORDER = (44, 46, 58)
-TEXT = (244, 245, 250)
-SUBTEXT = (170, 175, 190)
-MUTED = (60, 63, 78)
+# Flat, neutral palette: one background colour, colour only where it carries meaning
+BG = (31, 31, 33)
+BORDER = (58, 58, 62)
+TEXT = (240, 240, 240)
+SUBTEXT = (160, 160, 165)
+TILE = (44, 44, 48)
 KINDS = {
-    "alert": {"accent": (255, 77, 94), "level": 5, "label": "Confidence: very high"},
-    "possible": {"accent": (255, 176, 32), "level": 3, "label": "Confidence: moderate"},
-    "info": {"accent": (45, 212, 191), "level": 0, "label": ""},
+    "alert": {"accent": (229, 72, 77), "label": "High confidence"},
+    "possible": {"accent": (245, 165, 36), "label": "Medium confidence"},
+    "info": {"accent": (120, 160, 230), "label": ""},
 }
 FONTS = r"C:\Windows\Fonts"
 LOG_PATH = os.path.join(tempfile.gettempdir(), "tector_banner.log")
@@ -63,7 +64,7 @@ def rounded_mask(size, radius):
 
 
 def logo_mark(size, accent):
-    """Tector's mark: a magnifying glass with a spark, drawn at high resolution then downsampled."""
+    """Tector's mark: a magnifying glass, drawn at high resolution then downsampled."""
     big = size * 4
     img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
@@ -92,18 +93,12 @@ def wrap(draw, text, fnt, width):
 def render_card(kind, title, message, image, scale):
     """Draws the static card with Pillow (anti-aliased text and shapes)."""
     k = KINDS[kind]
-    accent = k["accent"]
     px = lambda v: int(round(v * scale))  # noqa: E731
     w, h = px(W), px(H)
-
     card = Image.new("RGB", (w, h), BG)
-    # soft accent glow behind the thumbnail
-    glow = Image.new("RGB", (w, h), BG)
-    ImageDraw.Draw(glow).ellipse([px(-60), px(-60), px(160), px(160)], fill=tuple(int(c * 0.3) for c in accent))
-    card = Image.blend(card, glow.filter(ImageFilter.GaussianBlur(px(55))), 0.7)
     d = ImageDraw.Draw(card)
 
-    # thumbnail of the flagged picture (or a logo tile for info cards)
+    # thumbnail of the flagged picture (or the Tector mark for info cards)
     tx, ty, ts = px(PAD), px(PAD), px(THUMB)
     if image is not None:
         thumb = (image if isinstance(image, Image.Image) else Image.open(image)).convert("RGB")
@@ -111,41 +106,27 @@ def render_card(kind, title, message, image, scale):
         thumb = thumb.crop(((thumb.width - side) // 2, (thumb.height - side) // 2,
                             (thumb.width + side) // 2, (thumb.height + side) // 2)).resize((ts, ts), Image.LANCZOS)
     else:
-        thumb = Image.new("RGB", (ts, ts), (28, 30, 40))
-        mark = logo_mark(px(56), accent + (255,))
+        thumb = Image.new("RGB", (ts, ts), TILE)
+        mark = logo_mark(px(40), SUBTEXT + (255,))
         thumb.paste(mark, ((ts - mark.width) // 2, (ts - mark.height) // 2), mark)
-    ring = Image.new("RGB", (ts + px(4), ts + px(4)), accent)
-    card.paste(ring, (tx - px(2), ty - px(2)), rounded_mask(ring.size, px(14)))
-    card.paste(thumb, (tx, ty), rounded_mask((ts, ts), px(12)))
+    card.paste(thumb, (tx, ty), rounded_mask((ts, ts), px(6)))
 
-    # brand row
-    x0 = tx + ts + px(18)
-    mark = logo_mark(px(16), accent + (255,))
-    card.paste(mark, (x0, px(18)), mark)
-    brand_font = font("seguisb.ttf", px(11))
-    bx = x0 + px(22)
-    for ch in "TECTOR":  # letter-spaced wordmark
-        d.text((bx, px(18)), ch, font=brand_font, fill=accent)
-        bx += d.textlength(ch, font=brand_font) + px(2.5)
-
-    # headline and message
-    d.text((x0, px(38)), title, font=font("segoeuib.ttf", px(18)), fill=TEXT)
-    msg_font = font("segoeui.ttf", px(12.5))
+    x0 = tx + ts + px(16)
+    d.text((x0, px(14)), "Tector", font=font("seguisb.ttf", px(11)), fill=SUBTEXT)
+    d.text((x0, px(31)), title, font=font("seguisb.ttf", px(16)), fill=TEXT)
+    msg_font = font("segoeui.ttf", px(12))
     for i, line in enumerate(wrap(d, message, msg_font, w - x0 - px(PAD))[:2]):
-        d.text((x0, px(66) + i * px(18)), line, font=msg_font, fill=SUBTEXT)
+        d.text((x0, px(56) + i * px(17)), line, font=msg_font, fill=SUBTEXT)
 
-    # confidence meter
-    if k["level"]:
-        my = px(113)
-        for i in range(5):
-            sx = x0 + i * px(26)
-            d.rounded_rectangle([sx, my, sx + px(22), my + px(6)], px(3), fill=accent if i < k["level"] else MUTED)
-        d.text((x0 + px(138), my - px(5)), k["label"], font=font("segoeui.ttf", px(11)), fill=SUBTEXT)
+    if k["label"]:  # confidence: a small solid square in the alert colour + plain text
+        sy = px(97)
+        d.rectangle([x0, sy + px(4), x0 + px(8), sy + px(12)], fill=k["accent"])
+        d.text((x0 + px(14), sy), k["label"], font=font("segoeui.ttf", px(11.5)), fill=TEXT)
 
     # close button
-    cx, cy, cr = w - px(22), px(22), px(5)
-    d.line([cx - cr, cy - cr, cx + cr, cy + cr], fill=SUBTEXT, width=max(1, px(1.6)))
-    d.line([cx - cr, cy + cr, cx + cr, cy - cr], fill=SUBTEXT, width=max(1, px(1.6)))
+    cx, cy, cr = w - px(20), px(20), px(4.5)
+    d.line([cx - cr, cy - cr, cx + cr, cy + cr], fill=SUBTEXT, width=max(1, px(1.4)))
+    d.line([cx - cr, cy + cr, cx + cr, cy - cr], fill=SUBTEXT, width=max(1, px(1.4)))
 
     d.rectangle([0, 0, w - 1, h - 1], outline=BORDER)
     return card
